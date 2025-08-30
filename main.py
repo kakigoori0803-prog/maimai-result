@@ -274,3 +274,29 @@ def view():
 </main>
 """
     return HTMLResponse(html)
+from datetime import datetime
+
+def parse_played_at(s: str):
+    # "YYYY/MM/DD HH:MM" → datetime
+    try:
+        return datetime.strptime(s, "%Y/%m/%d %H:%M")
+    except Exception:
+        return None
+
+@app.get("/latest")
+def latest(source: str = ""):
+    """
+    これまで保存済みの中で一番新しい playedAt を返す。
+    ?source= を指定すると sourceUrl が一致するものに限定（空なら全体）。
+    """
+    data = load_db()
+    latest_dt = None
+    latest_str = ""
+    for r in data:
+        if source and r.get("sourceUrl") != source:
+            continue
+        pa = parse_played_at(r.get("playedAt", ""))
+        if pa and (latest_dt is None or pa > latest_dt):
+            latest_dt = pa
+            latest_str = r.get("playedAt", "")
+    return {"latestPlayedAt": latest_str}
