@@ -5,17 +5,29 @@ import json, os, hashlib, csv
 from io import StringIO
 from datetime import datetime
 
+# -------- FastAPI 本体（※1回だけ作る）--------
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_methods=["*"], allow_headers=["*"], allow_credentials=False
 )
 
+# -------- /register ルーターの取り込み --------
+# register_router.py がプロジェクト直下にある想定
+try:
+    from register_router import router as register_router
+    app.include_router(register_router)  # これで /register が生える
+except Exception as e:
+    # もし無ければスキップ（/docs に /register は出ない）
+    print(f"[WARN] register_router not loaded: {e}")
+
+# -------- 設定 --------
 DB_FILE   = "db.json"
 API_TOKEN = os.getenv("API_TOKEN", "changeme")
 LOGO_URL  = os.getenv("LOGO_URL", "")
-PLACEHOLDER_IMG = os.getenv("PLACEHOLDER_IMG", "")  # 画像URLが無い時に出す任意のプレースホルダー
+PLACEHOLDER_IMG = os.getenv("PLACEHOLDER_IMG", "")  # 画像URLが無い時のプレースホルダー
 
+# -------- DB ユーティリティ --------
 def load_db():
     if not os.path.exists(DB_FILE): return []
     try:
@@ -26,9 +38,12 @@ def save_db(data):
     with open(DB_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False)
 
+# -------- Health --------
 @app.get("/health")
-def health(): return {"ok": True}
+def health(): 
+    return {"ok": True}
 
+# -------- Ingest --------
 @app.post("/ingest")
 async def ingest(request: Request):
     # 認証
@@ -57,8 +72,10 @@ async def ingest(request: Request):
     save_db(db)
     return JSONResponse({"status":"ok", "inserted": inserted, "total": len(db)})
 
+# -------- Data 出力 --------
 @app.get("/data")
-def data(): return load_db()
+def data(): 
+    return load_db()
 
 @app.get("/data/pretty", response_class=PlainTextResponse)
 def data_pretty():
@@ -75,7 +92,7 @@ def data_csv():
         w.writerow({k: r.get(k,"") for k in fieldnames})
     return PlainTextResponse(buf.getvalue(), media_type="text/csv")
 
-# ====== View ======
+# -------- View（HTML）--------
 def esc(s:str)->str:
     return str(s or "").replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
 
@@ -274,8 +291,8 @@ def view():
 </main>
 """
     return HTMLResponse(html)
-from datetime import datetime
 
+# -------- 補助API --------
 def parse_played_at(s: str):
     # "YYYY/MM/DD HH:MM" → datetime
     try:
@@ -300,9 +317,3 @@ def latest(source: str = ""):
             latest_dt = pa
             latest_str = r.get("playedAt", "")
     return {"latestPlayedAt": latest_str}
-
-from fastapi import FastAPI
-from register_router import router as register_router   # ← 追加
-
-app = FastAPI()
-app.include_router(register_router)                      # ← 追加
