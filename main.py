@@ -300,3 +300,9 @@ def latest(source: str = ""):
             latest_dt = pa
             latest_str = r.get("playedAt", "")
     return {"latestPlayedAt": latest_str}
+
+from fastapi import FastAPI
+from register_router import router as register_router   # ← 追加
+
+app = FastAPI()
+app.include_router(register_router)                      # ← 追加
