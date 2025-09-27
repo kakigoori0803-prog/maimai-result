@@ -1,23 +1,18 @@
-# register_router.py  ← 新規ファイル
-from fastapi import APIRouter
-from pydantic import BaseModel
+from fastapi import APIRouter, HTTPException
 import os, secrets
 
 router = APIRouter()
 
-class RegisterResponse(BaseModel):
-    ingest_url: str
-    bearer: str
-    user_id: str
-
-@router.post("/register", response_model=RegisterResponse, tags=["default"])
+@router.post("/register", tags=["default"])
 def register():
-    # 返す値（Renderの環境変数で上書き可能）
-    ingest = os.getenv("MRC_INGEST_URL", "https://maimai-result.onrender.com/ingest")
-    # ingest 側で使っている認証トークンと同じ値を MRC_DEFAULT_BEARER に入れておくのが一番簡単
-    bearer = os.getenv("MRC_DEFAULT_BEARER", "")
-    if not bearer:
-        # 予備（未設定でも一応返す）。本番は環境変数で固定を推奨
-        bearer = secrets.token_hex(16)
+    # /ingest と同じ認証トークンを返す
+    token = os.getenv("API_TOKEN", "")
+    if not token:
+        raise HTTPException(status_code=500, detail="API_TOKEN is not set")
+
+    # /ingest のURL（相対でOK。フルURLにしたいなら環境変数で上書き）
+    api_url = os.getenv("MRC_INGEST_URL", "/ingest")
+
     user_id = secrets.token_hex(16)
-    return {"ingest_url": ingest, "bearer": bearer, "user_id": user_id}
+    # mrc.js が期待する形で返す
+    return {"ok": True, "token": token, "api_url": api_url, "user_id": user_id}
