@@ -1,11 +1,12 @@
 # main.py
-from fastapi import FastAPI, HTTPException, Security, Body, Request, Form, Query
+from fastapi import FastAPI, HTTPException, Security, Body, Request, Query
 from fastapi.responses import JSONResponse, PlainTextResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import json, os, hashlib, csv, re
 from io import StringIO
 from datetime import datetime
+from urllib.parse import parse_qs  # ← 追加：x-www-form-urlencoded を自前で読む
 
 # -------- FastAPI --------
 app = FastAPI()
@@ -55,21 +56,32 @@ def parse_detail_html(html: str, url: str) -> dict:
         m = re.search(pat, html, flags)
         return (m.group(1) if m else "").strip()
 
+    # タイトル候補を手広く
     title = (
-        find(r'name=["\']music_title["\'][^>]*value=["\']([^"\']+)["\']')
-        or find(r'<input[^>]+type=["\']text["\'][^>]*value=["\']([^"\']+)["\']')
-        or find(r'<h[1-4][^>]*>([^<]{2,})</h[1-4]>')  # 念のため見出し fallback
+        find(r'name=["\']music_title["\'][^>]*value=["\']([^"\']+)["\']') or
+        find(r'<input[^>]+type=["\']text["\'][^>]*value=["\']([^"\']+)["\']') or
+        find(r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']+)["\']') or
+        find(r'<h[1-4][^>]*>([^<]{2,})</h[1-4]>') or
+        find(r'<img[^>]+class=["\'][^"\']*music[^"\']*["\'][^>]*alt=["\']([^"\']+)["\']')
     )
+
+    # スコア（100.1234% など）
     rate = (
-        find(r'([0-9]{2,3}\.[0-9]{4})\s*%')
-        or find(r'ACHIEVEMENT[^0-9]*([0-9]{2,3}\.[0-9]{4})')
+        find(r'([0-9]{2,3}\.[0-9]{4})\s*%') or
+        find(r'ACHIEVEMENT[^0-9]*([0-9]{2,3}\.[0-9]{4})')
     )
+
+    # 日時
     played = find(r'(\d{4}/\d{2}/\d{2}\s+\d{2}:\d{2})')
+
+    # 難易度・レベル
     difficulty = find(r'\b(Re:?MASTER|MASTER|EXPERT|ADVANCED|BASIC)\b')
     level = find(r'LEVEL[^0-9]*([0-9]{1,2}\+?)')
+
+    # ジャケット
     image = (
-        find(r'<img[^>]+src=["\'](https?://[^"\']+\.(?:png|jpg|jpeg|webp))["\']')
-        or find(r'background-image:\s*url\(["\']?(https?://[^"\')]+)["\']?\)')
+        find(r'<img[^>]+src=["\'](https?://[^"\']+\.(?:png|jpg|jpeg|webp))["\']') or
+        find(r'background-image:\s*url\(["\']?(https?://[^"\')]+)["\']?\)')
     )
 
     return {
@@ -161,31 +173,37 @@ async def ingest(
     inserted = ingest_from_body(body, now)
     return JSONResponse({"status":"ok", "inserted": inserted, "total": len(load_db())})
 
-# -------- Ingest（フォーム/テキストでもOK：ブックマークレット用）--------
+# -------- Ingest（フォーム / x-www-form-urlencoded / 生JSON すべてOK）--------
 @app.post("/ingest_form")
 async def ingest_form(
     request: Request,
-    token: str = Query("", description="API token (fallback when header not used)"),
-    payload: str | None = Form(default=None, description="JSON string payload")
+    token: str = Query("", description="API token (fallback when header not used)")
 ):
-    # 認証（?token だけでOK）
     if token != API_TOKEN:
         raise HTTPException(status_code=401, detail="Unauthorized (token)")
 
-    # 本文を取得（form の payload か、生テキスト）
-    if payload is None:
-        raw = await request.body()
-        if not raw:
-            raise HTTPException(status_code=400, detail="Empty body")
-        try:
-            body = json.loads(raw.decode("utf-8"))
-        except Exception:
-            raise HTTPException(status_code=400, detail="Invalid JSON")
-    else:
+    raw = await request.body()
+    if not raw:
+        raise HTTPException(status_code=400, detail="Empty body")
+
+    ctype = request.headers.get("Content-Type", "")
+    body: dict
+    if "application/x-www-form-urlencoded" in ctype:
+        # ブックマークレットの <form> から飛んでくる想定
+        d = parse_qs(raw.decode("utf-8"))
+        payload = (d.get("payload") or [""])[0]
+        if not payload:
+            raise HTTPException(status_code=400, detail="Missing 'payload'")
         try:
             body = json.loads(payload)
-        except Exception:
-            raise HTTPException(status_code=400, detail="Invalid JSON in 'payload'")
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Invalid JSON in 'payload': {e}")
+    else:
+        # 素の JSON も許可
+        try:
+            body = json.loads(raw.decode("utf-8"))
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Invalid JSON: {e}")
 
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     inserted = ingest_from_body(body, now)
