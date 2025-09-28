@@ -6,6 +6,8 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import json, os, hashlib, csv, re
 from io import StringIO
 from datetime import datetime
+from urllib.parse import urljoin
+import html as ihtml  # HTMLエンティティをデコード
 
 # -------- FastAPI --------
 app = FastAPI()
@@ -49,25 +51,65 @@ def save_db(data):
 def health():
     return {"ok": True}
 
-# -------- playlogDetail HTML 解析 --------
+# -------- playlogDetail HTML 解析（強化版）--------
 def parse_detail_html(html: str, url: str) -> dict:
-    """playlogDetail の HTML から最低限の情報を抽出"""
+    """
+    playlogDetail の HTML から最小限の情報を抽出（タグ分割にも強い版）
+    - テキスト化して 100.1234% / YYYY/MM/DD HH:MM / 難易度 などを抽出
+    - 画像の相対URLは urljoin で絶対URLに解決
+    """
     def find(pat, flags=re.I | re.S):
         m = re.search(pat, html, flags)
         return (m.group(1) if m else "").strip()
 
+    # タグを除去したテキスト（数値が <span> で分割されても検出できるように）
+    def as_text(h: str) -> str:
+        h = re.sub(r"<script[^>]*>.*?</script>|<style[^>]*>.*?</style>", " ", h, flags=re.I | re.S)
+        h = re.sub(r"<[^>]+>", " ", h)
+        h = ihtml.unescape(h)
+        h = re.sub(r"\s+", " ", h).strip()
+        return h
+
+    text = as_text(html)
+
+    # --- 曲名 ---
     title = (
+        # input value
         find(r'name=["\']music_title["\'][^>]*value=["\']([^"\']+)["\']')
+        or find(r'id=["\']music_title["\'][^>]*value=["\']([^"\']+)["\']')
         or find(r'<input[^>]+type=["\']text["\'][^>]*value=["\']([^"\']+)["\']')
+        # class が title / music を含む要素の直下テキスト
+        or find(r'class=["\'][^"\']*(?:music[^"\']*|title)[^"\']*["\'][^>]*>([^<]{1,80})<')
+        # 画像の alt
+        or find(r'<img[^>]+alt=["\']([^"\']{1,80})["\']')
     )
-    rate = (
-        find(r'([0-9]{2,3}\.[0-9]{4})\s*%')
-        or find(r'ACHIEVEMENT[^0-9]*([0-9]{2,3}\.[0-9]{4})')
+
+    # --- スコア（100.1234%）---
+    m = re.search(r'(\d{2,3}\.\d{4})\s*%', text)
+    if m:
+        rate = m.group(1)
+    else:
+        m2 = re.search(r'ACHIEVEMENT.*?(\d{2,3}\.\d{4}).*?%', html, flags=re.I | re.S)
+        rate = (m2.group(1).strip() if m2 else "")
+
+    # --- プレイ日時 ---
+    played = ""
+    m = re.search(r'(\d{4}/\d{2}/\d{2}\s+\d{2}:\d{2})', text)
+    if m:
+        played = m.group(1)
+
+    # --- 難易度・レベル ---
+    md = re.search(r'(Re:?MASTER|MASTER|EXPERT|ADVANCED|BASIC)', text, flags=re.I)
+    difficulty = (md.group(1) if md else "")
+    ml = re.search(r'LEVEL\s*([0-9]{1,2}\+?)', text, flags=re.I)
+    level = (ml.group(1) if ml else "")
+
+    # --- ジャケット画像 ---
+    img = (
+        find(r'<img[^>]+src=["\']([^"\']+\.(?:png|jpg|jpeg|webp))["\']')
+        or find(r'background-image:\s*url\((["\']?)([^)]+?\.(?:png|jpg|jpeg|webp))\1\)', flags=re.I)
     )
-    played = find(r'(\d{4}/\d{2}/\d{2}\s+\d{2}:\d{2})')
-    difficulty = find(r'\b(Re:?MASTER|MASTER|EXPERT|ADVANCED|BASIC)\b')
-    level = find(r'LEVEL[^0-9]*([0-9]{1,2}\+?)')
-    image = find(r'<img[^>]+src=["\'](https?://[^"\']+\.(?:png|jpg|jpeg|webp))["\']')
+    image_url = urljoin(url or "", img) if img else ""
 
     return {
         "title": title,
@@ -75,7 +117,7 @@ def parse_detail_html(html: str, url: str) -> dict:
         "playedAt": played,           # "YYYY/MM/DD HH:MM"
         "difficulty": difficulty,     # "MASTER" / "Re:MASTER" etc
         "level": level,               # "13" / "13+"
-        "imageUrl": image or "",
+        "imageUrl": image_url,
         "sourceUrl": url or "",
     }
 
