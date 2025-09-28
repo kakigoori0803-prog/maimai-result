@@ -1,4 +1,4 @@
-# main.py
+# main.py — maimai result (完全版)
 from fastapi import FastAPI, HTTPException, Security, Body, Request, Query
 from fastapi.responses import JSONResponse, PlainTextResponse, HTMLResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -6,31 +6,30 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import json, os, hashlib, csv, re
 from io import StringIO
 from datetime import datetime
-from urllib.parse import parse_qs  # x-www-form-urlencoded を読む用
+from urllib.parse import parse_qs
 
-# -------- FastAPI --------
+# ---------------- FastAPI 基本設定 ----------------
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_methods=["*"], allow_headers=["*"], allow_credentials=False
 )
-
 security = HTTPBearer(auto_error=False)
 
-# -------- /register 取り込み --------
+# ---------------- /register 取り込み（任意） ----------------
 try:
     from register_router import router as register_router
     app.include_router(register_router)  # /register
 except Exception as e:
     print(f"[WARN] register_router not loaded: {e}")
 
-# -------- 設定 --------
+# ---------------- 環境変数など ----------------
 DB_FILE   = "db.json"
 API_TOKEN = os.getenv("API_TOKEN", "changeme")
 LOGO_URL  = os.getenv("LOGO_URL", "")
 PLACEHOLDER_IMG = os.getenv("PLACEHOLDER_IMG", "")
 
-# -------- DB ユーティリティ --------
+# ---------------- DB ユーティリティ ----------------
 def load_db():
     if not os.path.exists(DB_FILE):
         return []
@@ -44,49 +43,71 @@ def save_db(data):
     with open(DB_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False)
 
-# -------- Root / Health --------
-@app.get("/")
-def root():
-    return RedirectResponse("/view")
-
+# ---------------- Health ----------------
 @app.get("/health")
 def health():
     return {"ok": True}
 
-# -------- playlogDetail HTML 解析 --------
+# ---------------- playlogDetail HTML 解析（強化版） ----------------
 def parse_detail_html(html: str, url: str) -> dict:
-    """playlogDetail の HTML から最低限の情報を抽出"""
+    """playlogDetail の HTML から曲名/達成率/日時/難易度/レベル/画像を抽出（相対URL対応）"""
     def find(pat, flags=re.I | re.S):
         m = re.search(pat, html, flags)
         return (m.group(1) if m else "").strip()
 
-    # タイトル候補（複数フォールバック）
+    def to_abs(u: str, src: str) -> str:
+        """相対URL → 絶対URL"""
+        if not u:
+            return ""
+        if u.startswith("http://") or u.startswith("https://"):
+            return u
+        if u.startswith("//"):
+            return "https:" + u
+        m = re.match(r"^(https?://[^/]+)", src or "")
+        origin = m.group(1) if m else ""
+        if u.startswith("/"):
+            return (origin + u) if origin else u
+        base = src.rsplit("/", 1)[0] if src and "/" in src else origin
+        return (base + "/" + u) if base else u
+
+    # 曲名：hidden/input/div/meta/img.alt/title など広めに
     title = (
         find(r'name=["\']music_title["\'][^>]*value=["\']([^"\']+)["\']') or
         find(r'<input[^>]+type=["\']text["\'][^>]*value=["\']([^"\']+)["\']') or
+        find(r'<div[^>]+class=["\'][^"\']*music_name_block[^"\']*["\'][^>]*>\s*([^<]{2,100})\s*</') or
+        find(r'<div[^>]+class=["\'][^"\']*music_name[^"\']*["\'][^>]*>\s*([^<]{2,100})\s*</') or
         find(r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']+)["\']') or
-        find(r'<h[1-4][^>]*>([^<]{2,})</h[1-4]>') or
-        find(r'<img[^>]+class=["\'][^"\']*music[^"\']*["\'][^>]*alt=["\']([^"\']+)["\']')
+        find(r'<img[^>]+alt=["\']([^"\']+)["\'][^>]*class=["\'][^"\']*music[^"\']*["\']') or
+        find(r'<title[^>]*>\s*([^<]{2,100})\s*</title>')
     )
 
-    # スコア（100.1234% など）
+    # 達成率：% と &percnt; の両方、ACHIEVEMENT 表記もカバー
     rate = (
         find(r'([0-9]{2,3}\.[0-9]{4})\s*%') or
+        find(r'([0-9]{2,3}\.[0-9]{4})\s*(?:&percnt;|&#37;)') or
         find(r'ACHIEVEMENT[^0-9]*([0-9]{2,3}\.[0-9]{4})')
     )
 
-    # 日時
+    # プレイ日時
     played = find(r'(\d{4}/\d{2}/\d{2}\s+\d{2}:\d{2})')
 
     # 難易度・レベル
-    difficulty = find(r'\b(Re:?MASTER|MASTER|EXPERT|ADVANCED|BASIC)\b')
-    level = find(r'LEVEL[^0-9]*([0-9]{1,2}\+?)')
-
-    # ジャケット
-    image = (
-        find(r'<img[^>]+src=["\'](https?://[^"\']+\.(?:png|jpg|jpeg|webp))["\']') or
-        find(r'background-image:\s*url\(["\']?(https?://[^"\')]+)["\']?\)')
+    difficulty = (
+        find(r'\b(Re:?MASTER|MASTER|EXPERT|ADVANCED|BASIC)\b') or
+        find(r'class=["\'][^"\']*(re:?master|master|expert|advanced|basic)[^"\']*["\']')
     )
+    level = (
+        find(r'LEVEL[^0-9]*([0-9]{1,2}\+?)') or
+        find(r'Lv\.?\s*([0-9]{1,2}\+?)')
+    )
+
+    # ジャケット画像（相対パスもOK）
+    img_rel = (
+        find(r'<img[^>]+class=["\'][^"\']*(?:jacket|music)[^"\']*["\'][^>]*src=["\']([^"\']+)["\']') or
+        find(r'<img[^>]+src=["\']([^"\']+\.(?:png|jpg|jpeg|webp))["\']') or
+        find(r'background-image:\s*url\(["\']?([^"\')]+)["\']?\)')
+    )
+    image = to_abs(img_rel, url)
 
     return {
         "title": title,
@@ -98,12 +119,11 @@ def parse_detail_html(html: str, url: str) -> dict:
         "sourceUrl": url or "",
     }
 
-# -------- 共通: 受信ボディを DB に反映 --------
+# ---------------- 共通（DB 反映） ----------------
 def ingest_from_body(body: dict, now: str) -> int:
     db = load_db()
     inserted = 0
 
-    # ① items 方式
     items = body.get("items") or []
     if isinstance(items, list) and items:
         src = body.get("sourceUrl") or ""
@@ -117,7 +137,6 @@ def ingest_from_body(body: dict, now: str) -> int:
                 db.append(item)
                 inserted += 1
 
-    # ② html 方式
     elif isinstance(body.get("html"), str):
         url  = body.get("url") or body.get("sourceUrl") or ""
         html = body.get("html") or ""
@@ -139,7 +158,7 @@ def ingest_from_body(body: dict, now: str) -> int:
     save_db(db)
     return inserted
 
-# -------- Ingest（JSON/fetch 用）--------
+# ---------------- Ingest（JSON / fetch） ----------------
 @app.post("/ingest")
 async def ingest(
     request: Request,
@@ -165,75 +184,59 @@ async def ingest(
         }
     })
 ):
-    # 認証（ヘッダ or ?token）
+    # 認証（Bearer もしくは ?token）
     scheme = (credentials.scheme if credentials else "") or ""
     token_h = (credentials.credentials if credentials else "") or ""
     token_q = request.query_params.get("token") or ""
-    if (scheme.lower() == "bearer" and token_h == API_TOKEN) or (token_q == API_TOKEN):
-        pass
-    else:
+    if not ((scheme.lower()=="bearer" and token_h==API_TOKEN) or (token_q==API_TOKEN)):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     inserted = ingest_from_body(body, now)
     return JSONResponse({"status":"ok", "inserted": inserted, "total": len(load_db())})
 
-# -------- Ingest（フォーム/x-www-form-urlencoded/生JSON すべてOK）--------
-@app.post("/ingest_form", response_class=HTMLResponse)
+# ---------------- Ingest（x-www-form-urlencoded / 生JSON） ----------------
+@app.post("/ingest_form")
 async def ingest_form(
     request: Request,
-    token: str = Query("", description="API token (fallback when header not used)")
+    token: str = Query("", description="API token (?token=...)")
 ):
-    # 認証（ブックマークレットは ?token=... で渡す）
+    # 認証（?token 必須）
     if token != API_TOKEN:
-        return HTMLResponse("<h1>401 Unauthorized</h1>", status_code=401)
+        raise HTTPException(status_code=401, detail="Unauthorized (token)")
 
     raw = await request.body()
     if not raw:
-        return HTMLResponse("<h1>400 Empty body</h1>", status_code=400)
+        raise HTTPException(status_code=400, detail="Empty body")
 
     ctype = request.headers.get("Content-Type", "")
-    try:
-        if "application/x-www-form-urlencoded" in ctype:
-            d = parse_qs(raw.decode("utf-8"))
-            payload = (d.get("payload") or [""])[0]
+    if "application/x-www-form-urlencoded" in ctype:
+        # bookmarklet の form から来る
+        d = parse_qs(raw.decode("utf-8"))
+        payload = (d.get("payload") or [""])[0]
+        if not payload:
+            raise HTTPException(status_code=400, detail="Missing 'payload'")
+        try:
             body = json.loads(payload)
-        else:
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Invalid JSON in 'payload': {e}")
+    else:
+        # 素の JSON も許可
+        try:
             body = json.loads(raw.decode("utf-8"))
-    except Exception as e:
-        return HTMLResponse(f"<h1>400 Invalid JSON</h1><pre>{e}</pre>", status_code=400)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Invalid JSON: {e}")
 
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    try:
-        inserted = ingest_from_body(body, now)
-    except HTTPException as he:
-        return HTMLResponse(f"<h1>{he.status_code} Error</h1><pre>{he.detail}</pre>", status_code=he.status_code)
-    except Exception as e:
-        return HTMLResponse(f"<h1>500 Server Error</h1><pre>{e}</pre>", status_code=500)
+    inserted = ingest_from_body(body, now)
+    return JSONResponse({"status":"ok", "inserted": inserted, "total": len(load_db())})
 
-    # 成功画面（自動遷移）
-    html = f"""<!doctype html>
-<meta charset="utf-8">
-<title>ingested</title>
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<meta http-equiv="refresh" content="0.8; url=/view">
-<style>
-  body {{ font-family:-apple-system,system-ui,Segoe UI,Roboto,'Noto Sans JP',sans-serif;
-         background:#0f172a; color:#e5e7eb; display:grid; place-items:center; height:100dvh; margin:0; }}
-  .card {{ background:#111827; border:1px solid rgba(255,255,255,.08); padding:20px 24px; border-radius:12px; }}
-  .muted {{ color:#94a3b8; font-size:13px; }}
-  a {{ color:#93c5fd; text-decoration:none; }}
-</style>
-<div class="card">
-  <h1 style="margin:0 0 6px">送信完了</h1>
-  <div>取り込み <b>{inserted}</b> 件</div>
-  <div class="muted">自動で結果ページへ移動します。<br><a href="/view">移動しない場合はここをタップ</a></div>
-</div>
-<script>setTimeout(()=>location.replace("/view"), 600);</script>
-"""
-    return HTMLResponse(html, status_code=200)
+# GET で誤アクセスされた時の簡単な案内
+@app.get("/ingest_form", response_class=PlainTextResponse)
+def ingest_form_get():
+    return "POST /ingest_form?token=... へ送信してください."
 
-# -------- Data 出力 --------
+# ---------------- Data 出力 ----------------
 @app.get("/data")
 def data():
     return load_db()
@@ -257,7 +260,7 @@ def data_csv():
         w.writerow({k: r.get(k, "") for k in fieldnames})
     return PlainTextResponse(buf.getvalue(), media_type="text/csv")
 
-# -------- View（HTML）--------
+# ---------------- View（HTML） ----------------
 def esc(s: str) -> str:
     return str(s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
@@ -434,12 +437,12 @@ def view():
   </nav>
 </header>
 <main>
-  {''.join(cards) if cards else '<div class="empty" style="text-align:center;color:#94a3b8;padding:40px 8px;">データがありません。ショートカットから同期してね。</div>'}
+  {''.join(cards) if cards else '<div class="empty" style="text-align:center;color:#94a3b8;padding:40px 8px;">データがありません。ショートカットやブックマークから同期してね。</div>'}
 </main>
 """
     return HTMLResponse(html)
 
-# -------- 補助API --------
+# ---------------- 補助API ----------------
 def parse_played_at(s: str):
     try:
         return datetime.strptime(s, "%Y/%m/%d %H:%M")
@@ -459,3 +462,8 @@ def latest(source: str = ""):
             latest_dt = pa
             latest_str = r.get("playedAt", "")
     return {"latestPlayedAt": latest_str}
+
+# ルートは /view へリダイレクト（白画面回避）
+@app.get("/")
+def root():
+    return RedirectResponse(url="/view")
