@@ -14,7 +14,7 @@ app.add_middleware(
     allow_origins=["*"], allow_methods=["*"], allow_headers=["*"], allow_credentials=False
 )
 
-# ドキュメントに Bearer を出すためのセキュリティ定義
+# Swagger で Bearer 入力欄を出す用
 security = HTTPBearer(auto_error=False)
 
 # -------- /register 取り込み --------
@@ -32,7 +32,8 @@ PLACEHOLDER_IMG = os.getenv("PLACEHOLDER_IMG", "")
 
 # -------- DB ユーティリティ --------
 def load_db():
-    if not os.path.exists(DB_FILE): return []
+    if not os.path.exists(DB_FILE):
+        return []
     try:
         with open(DB_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
@@ -51,7 +52,7 @@ def health():
 # -------- playlogDetail HTML 解析 --------
 def parse_detail_html(html: str, url: str) -> dict:
     """playlogDetail の HTML から最低限の情報を抽出"""
-    def find(pat, flags=re.I|re.S):
+    def find(pat, flags=re.I | re.S):
         m = re.search(pat, html, flags)
         return (m.group(1) if m else "").strip()
 
@@ -59,7 +60,7 @@ def parse_detail_html(html: str, url: str) -> dict:
         find(r'name=["\']music_title["\'][^>]*value=["\']([^"\']+)["\']')
         or find(r'<input[^>]+type=["\']text["\'][^>]*value=["\']([^"\']+)["\']')
     )
-    rate = (  # 100.1234% など
+    rate = (
         find(r'([0-9]{2,3}\.[0-9]{4})\s*%')
         or find(r'ACHIEVEMENT[^0-9]*([0-9]{2,3}\.[0-9]{4})')
     )
@@ -78,21 +79,28 @@ def parse_detail_html(html: str, url: str) -> dict:
         "sourceUrl": url or "",
     }
 
-# -------- Ingest --------
+# -------- Ingest（空/不正JSONでも安全、401/400 を明示）--------
 @app.post("/ingest")
 async def ingest(
     request: Request,
-    credentials: HTTPAuthorizationCredentials = Security(security)
+    credentials: HTTPAuthorizationCredentials = Security(security),
 ):
-    # 認証（/docs の Authorize からも通せる）
+    # 認証
     scheme = (credentials.scheme if credentials else "") or ""
-    token  = (credentials.credentials if credentials else "") or ""
+    token = (credentials.credentials if credentials else "") or ""
     if scheme.lower() != "bearer" or token != API_TOKEN:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-    body = await request.json()
-    now  = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    # JSON を安全に読む（空や壊れた JSON は 400）
+    raw = await request.body()
+    if not raw:
+        raise HTTPException(status_code=400, detail="Empty request body")
+    try:
+        body = json.loads(raw.decode("utf-8"))
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
 
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     db = load_db()
     inserted = 0
 
@@ -101,32 +109,37 @@ async def ingest(
     if isinstance(items, list) and items:
         src = body.get("sourceUrl") or ""
         for item in items:
-            key  = f"{item.get('title','')}|{item.get('rate','')}|{item.get('playedAt','')}"
+            key = f"{item.get('title','')}|{item.get('rate','')}|{item.get('playedAt','')}"
             uniq = hashlib.sha1(key.encode()).hexdigest()
-            if not any(r.get("uniq")==uniq for r in db):
-                item["uniq"]       = uniq
-                item["sourceUrl"]  = item.get("sourceUrl") or src
+            if not any(r.get("uniq") == uniq for r in db):
+                item["uniq"] = uniq
+                item["sourceUrl"] = item.get("sourceUrl") or src
                 item["ingestedAt"] = body.get("ingestedAt") or now
                 db.append(item)
                 inserted += 1
 
-    # ② html 方式（mrc.js が送る形）
+    # ② html 方式（mrc.js）
     elif isinstance(body.get("html"), str):
-        url  = body.get("url") or body.get("sourceUrl") or ""
+        url = body.get("url") or body.get("sourceUrl") or ""
         html = body.get("html") or ""
         item = parse_detail_html(html, url)
-
+        # 何か1つでも拾えていれば保存
         if item.get("rate") or item.get("playedAt") or item.get("title"):
-            key  = f"{item.get('title','')}|{item.get('rate','')}|{item.get('playedAt','')}"
+            key = f"{item.get('title','')}|{item.get('rate','')}|{item.get('playedAt','')}"
             uniq = hashlib.sha1(key.encode()).hexdigest()
-            if not any(r.get("uniq")==uniq for r in db):
-                item["uniq"]       = uniq
+            if not any(r.get("uniq") == uniq for r in db):
+                item["uniq"] = uniq
                 item["ingestedAt"] = now
                 db.append(item)
                 inserted += 1
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail="Payload must be {items:[...]} or {html:..., url:...}",
+        )
 
     save_db(db)
-    return JSONResponse({"status":"ok", "inserted": inserted, "total": len(db)})
+    return JSONResponse({"status": "ok", "inserted": inserted, "total": len(db)})
 
 # -------- Data 出力 --------
 @app.get("/data")
@@ -137,45 +150,64 @@ def data():
 def data_pretty():
     return PlainTextResponse(
         json.dumps(load_db(), ensure_ascii=False, indent=2),
-        media_type="application/json"
+        media_type="application/json",
     )
 
 @app.get("/data.csv", response_class=PlainTextResponse)
 def data_csv():
     buf = StringIO()
-    fieldnames = ["playedAt","title","difficulty","level","rate","imageUrl","ingestedAt","sourceUrl"]
+    fieldnames = [
+        "playedAt",
+        "title",
+        "difficulty",
+        "level",
+        "rate",
+        "imageUrl",
+        "ingestedAt",
+        "sourceUrl",
+    ]
     w = csv.DictWriter(buf, fieldnames=fieldnames)
     w.writeheader()
     for r in load_db():
-        w.writerow({k: r.get(k,"") for k in fieldnames})
+        w.writerow({k: r.get(k, "") for k in fieldnames})
     return PlainTextResponse(buf.getvalue(), media_type="text/csv")
 
 # -------- View（HTML）--------
-def esc(s:str)->str:
-    return str(s or "").replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
+def esc(s: str) -> str:
+    return str(s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
-def date_of(played_at:str)->str:
-    if not played_at: return ""
+def date_of(played_at: str) -> str:
+    if not played_at:
+        return ""
     return played_at.split()[0]
 
 def human_rate(v):
-    try: return f"{float(v):.4f}%"
-    except: return esc(v)
+    try:
+        return f"{float(v):.4f}%"
+    except:
+        return esc(v)
 
 def diff_badge(d, level=None):
     d_raw = (d or "").strip()
     d_l = d_raw.lower()
-    color = "#64748b"; label = d_raw or "-"
-    if "basic" in d_l:   color, label = "#22c55e","BASIC"
-    elif "advanced" in d_l or d_l=="adv": color, label = "#eab308","ADVANCED"
-    elif "expert" in d_l:  color, label = "#ef4444","EXPERT"
-    elif "master" in d_l and "re" not in d_l: color, label = "#a855f7","MASTER"
-    elif "re:master" in d_l or "remaster" in d_l or "re"==d_l:
+    color = "#64748b"
+    label = d_raw or "-"
+    if "basic" in d_l:
+        color, label = "#22c55e", "BASIC"
+    elif "advanced" in d_l or d_l == "adv":
+        color, label = "#eab308", "ADVANCED"
+    elif "expert" in d_l:
+        color, label = "#ef4444", "EXPERT"
+    elif "master" in d_l and "re" not in d_l:
+        color, label = "#a855f7", "MASTER"
+    elif "re:master" in d_l or "remaster" in d_l or "re" == d_l:
         badge = "<span class='badge remaster'>Re:MASTER</span>"
-        if level: badge += f"<span class='lvl'>{esc(level)}</span>"
+        if level:
+            badge += f"<span class='lvl'>{esc(level)}</span>"
         return badge
     badge = f"<span class='badge' style='background:{color}'>{label}</span>"
-    if level: badge += f"<span class='lvl'>{esc(level)}</span>"
+    if level:
+        badge += f"<span class='lvl'>{esc(level)}</span>"
     return badge
 
 def rank_class(rate):
@@ -183,55 +215,69 @@ def rank_class(rate):
         r = float(rate)
     except:
         return "rk-none"
-    if r >= 100.5: return "rk-sssplus"
-    if r >= 100.0: return "rk-sss"
-    if r >= 99.5:  return "rk-ssplus"
-    if r >= 99.0:  return "rk-ss"
-    if r >= 98.0:  return "rk-splus"
-    if r >= 97.0:  return "rk-s"
+    if r >= 100.5:
+        return "rk-sssplus"
+    if r >= 100.0:
+        return "rk-sss"
+    if r >= 99.5:
+        return "rk-ssplus"
+    if r >= 99.0:
+        return "rk-ss"
+    if r >= 98.0:
+        return "rk-splus"
+    if r >= 97.0:
+        return "rk-s"
     return "rk-none"
 
 @app.get("/view", response_class=HTMLResponse)
 def view():
     data = load_db()
-    data.sort(key=lambda r: r.get("ingestedAt",""), reverse=True)
+    data.sort(key=lambda r: r.get("ingestedAt", ""), reverse=True)
 
     groups = {}
     for r in data:
-        d = date_of(r.get("playedAt",""))
+        d = date_of(r.get("playedAt", ""))
         groups.setdefault(d, []).append(r)
 
-    cutoff_ts = datetime.now().timestamp() - 24*3600
-    logo_html = (f"<img src='{esc(LOGO_URL)}' alt='logo' class='logo'>"
-                 if LOGO_URL else "<div class='logo-text'>maimai result</div>")
+    cutoff_ts = datetime.now().timestamp() - 24 * 3600
+    logo_html = (
+        f"<img src='{esc(LOGO_URL)}' alt='logo' class='logo'>"
+        if LOGO_URL
+        else "<div class='logo-text'>maimai result</div>"
+    )
 
     cards = []
-    for d, rows in sorted(groups.items(), key=lambda x:x[0], reverse=True):
+    for d, rows in sorted(groups.items(), key=lambda x: x[0], reverse=True):
         rows_html = []
         for r in rows:
+            # NEW 判定
             is_new = False
             try:
-                ts = datetime.strptime(r.get("ingestedAt",""), "%Y-%m-%d %H:%M:%S").timestamp()
+                ts = datetime.strptime(
+                    r.get("ingestedAt", ""), "%Y-%m-%d %H:%M:%S"
+                ).timestamp()
                 is_new = ts >= cutoff_ts
             except:
                 pass
 
-            title = esc(r.get("title",""))
+            title = esc(r.get("title", ""))
             difficulty = r.get("difficulty") or ""
             level = r.get("level")
-            rate  = r.get("rate","")
+            rate = r.get("rate", "")
             rate_txt = human_rate(rate)
             rate_cls = rank_class(rate)
-            played_at = esc(r.get("playedAt",""))
+            played_at = esc(r.get("playedAt", ""))
             new_tag = "<span class='new'>NEW</span>" if is_new else ""
 
             img = r.get("imageUrl") or PLACEHOLDER_IMG or ""
             img_html = (
                 f"<img class='jacket' src='{esc(img)}' alt=' ' loading='lazy' referrerpolicy='no-referrer'>"
-                if img else "<div class='jacket ph'></div>"
+                if img
+                else "<div class='jacket ph'></div>"
             )
 
-            rows_html.append(f"""
+            rows_html.append(
+                f"""
 <li class='row'>
   <div class='left'>
     {img_html}
@@ -242,15 +288,18 @@ def view():
   </div>
   <div class='right {rate_cls}'>{rate_txt}</div>
 </li>
-""")
-        cards.append(f"""
+"""
+            )
+        cards.append(
+            f"""
 <section class='card'>
   <h2>{esc(d) or '未日付'}</h2>
   <ul class='list'>
     {''.join(rows_html)}
   </ul>
 </section>
-""")
+"""
+        )
 
     html = f"""<!doctype html>
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -299,7 +348,6 @@ def view():
   .left .title {{ font-size:15px; font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:62vw; }}
   .left .meta  {{ font-size:12px; color:var(--muted); margin-top:2px; }}
   .right {{ font-variant-numeric: tabular-nums; font-size:16px; font-weight:700; text-align:right; min-width:88px; }}
-
   .jacket {{
     width:44px; height:44px; border-radius:8px; flex:0 0 auto; object-fit:cover;
     border:1px solid rgba(255,255,255,.08); background:#0b1220;
@@ -307,7 +355,6 @@ def view():
   .jacket.ph {{
     display:inline-block; background:repeating-linear-gradient(45deg, #0b1220 0 8px, #0e1627 8px 16px);
   }}
-
   .badge {{
     display:inline-block; padding:2px 6px; border-radius:999px; color:#fff; font-size:11px; margin-left:6px;
   }}
