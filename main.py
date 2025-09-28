@@ -1,7 +1,8 @@
+# main.py
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse, PlainTextResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
-import json, os, hashlib, csv
+import json, os, hashlib, csv, re
 from io import StringIO
 from datetime import datetime
 
@@ -40,8 +41,47 @@ def save_db(data):
 
 # -------- Health --------
 @app.get("/health")
-def health(): 
+def health():
     return {"ok": True}
+
+# -------- playlogDetail HTML 解析 --------
+def parse_detail_html(html: str, url: str) -> dict:
+    """
+    playlogDetail ページの HTML から最低限の情報を抜き出す。
+    取れなければ空文字を返す。
+    """
+    def find(pat, flags=re.I):
+        m = re.search(pat, html, flags)
+        return (m.group(1) if m else "").strip()
+
+    # 曲名（input の value / それが無ければ最初の text input）
+    title = (
+        find(r'name=["\']music_title["\'][^>]*value=["\']([^"\']+)["\']')
+        or find(r'<input[^>]+type=["\']text["\'][^>]*value=["\']([^"\']+)["\']')
+    )
+
+    # スコア（100.1234% 形式 → 数値部分だけ）
+    rate = find(r'([0-9]{2,3}\.[0-9]{4})\s*%') or find(r'ACHIEVEMENT[^0-9]*([0-9]{2,3}\.[0-9]{4})')
+
+    # 日時（2025/09/24 23:39 など）
+    played = find(r'(\d{4}/\d{2}/\d{2}\s+\d{2}:\d{2})')
+
+    # 難易度・レベル
+    difficulty = find(r'\b(Re:?MASTER|MASTER|EXPERT|ADVANCED|BASIC)\b')
+    level      = find(r'LEVEL[^0-9]*([0-9]{1,2}\+?)')
+
+    # ジャケット（最初に出てくる画像URLをざっくり）
+    image = find(r'<img[^>]+src=["\'](https?://[^"\']+\.(?:png|jpg|jpeg|webp))["\']')
+
+    return {
+        "title": title,
+        "rate":  rate,               # 例: "100.8390"
+        "playedAt": played,          # 例: "2025/09/24 23:39"
+        "difficulty": difficulty,    # 例: "MASTER" / "Re:MASTER"
+        "level": level,              # 例: "13" / "13+"
+        "imageUrl": image or "",
+        "sourceUrl": url or "",
+    }
 
 # -------- Ingest --------
 @app.post("/ingest")
@@ -51,30 +91,47 @@ async def ingest(request: Request):
     if auth != f"Bearer {API_TOKEN}":
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-    body   = await request.json()
-    items  = body.get("items", [])
-    src    = body.get("sourceUrl") or ""
-    now    = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    db = load_db()
+    body = await request.json()
+    now  = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    db   = load_db()
     inserted = 0
-    for item in items:
-        # 受信項目例: title, rate, playedAt, difficulty(optional), level(optional), imageUrl(optional)
-        key = f"{item.get('title','')}|{item.get('rate','')}|{item.get('playedAt','')}"
-        uniq = hashlib.sha1(key.encode()).hexdigest()
-        if not any(r.get("uniq")==uniq for r in db):
-            item["uniq"] = uniq
-            item["sourceUrl"]  = src
-            item["ingestedAt"] = body.get("ingestedAt") or now
-            db.append(item)
-            inserted += 1
+
+    # ① 従来互換（items 方式）
+    items = body.get("items") or []
+    if isinstance(items, list) and items:
+        src = body.get("sourceUrl") or ""
+        for item in items:
+            key  = f"{item.get('title','')}|{item.get('rate','')}|{item.get('playedAt','')}"
+            uniq = hashlib.sha1(key.encode()).hexdigest()
+            if not any(r.get("uniq")==uniq for r in db):
+                item["uniq"]       = uniq
+                item["sourceUrl"]  = item.get("sourceUrl") or src
+                item["ingestedAt"] = body.get("ingestedAt") or now
+                db.append(item)
+                inserted += 1
+
+    # ② 新方式（html 方式）: { "url": "...playlogDetail...", "html": "<!doctype ...>" }
+    elif isinstance(body.get("html"), str):
+        url  = body.get("url") or body.get("sourceUrl") or ""
+        html = body.get("html") or ""
+        item = parse_detail_html(html, url)
+
+        # 何かしら取れていれば保存（完全に空ならスキップ）
+        if item.get("rate") or item.get("playedAt") or item.get("title"):
+            key  = f"{item.get('title','')}|{item.get('rate','')}|{item.get('playedAt','')}"
+            uniq = hashlib.sha1(key.encode()).hexdigest()
+            if not any(r.get("uniq")==uniq for r in db):
+                item["uniq"]       = uniq
+                item["ingestedAt"] = now
+                db.append(item)
+                inserted += 1
 
     save_db(db)
     return JSONResponse({"status":"ok", "inserted": inserted, "total": len(db)})
 
 # -------- Data 出力 --------
 @app.get("/data")
-def data(): 
+def data():
     return load_db()
 
 @app.get("/data/pretty", response_class=PlainTextResponse)
