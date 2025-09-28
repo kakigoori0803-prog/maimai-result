@@ -1,39 +1,43 @@
 # main.py
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, Security
 from fastapi.responses import JSONResponse, PlainTextResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import json, os, hashlib, csv, re
 from io import StringIO
 from datetime import datetime
 
-# -------- FastAPI 本体（※1回だけ作る）--------
+# -------- FastAPI --------
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_methods=["*"], allow_headers=["*"], allow_credentials=False
 )
 
-# -------- /register ルーターの取り込み --------
-# register_router.py がプロジェクト直下にある想定
+# ドキュメントに Bearer を出すためのセキュリティ定義
+security = HTTPBearer(auto_error=False)
+
+# -------- /register 取り込み --------
 try:
     from register_router import router as register_router
-    app.include_router(register_router)  # これで /register が生える
+    app.include_router(register_router)  # /register
 except Exception as e:
-    # もし無ければスキップ（/docs に /register は出ない）
     print(f"[WARN] register_router not loaded: {e}")
 
 # -------- 設定 --------
 DB_FILE   = "db.json"
 API_TOKEN = os.getenv("API_TOKEN", "changeme")
 LOGO_URL  = os.getenv("LOGO_URL", "")
-PLACEHOLDER_IMG = os.getenv("PLACEHOLDER_IMG", "")  # 画像URLが無い時のプレースホルダー
+PLACEHOLDER_IMG = os.getenv("PLACEHOLDER_IMG", "")
 
 # -------- DB ユーティリティ --------
 def load_db():
     if not os.path.exists(DB_FILE): return []
     try:
-        with open(DB_FILE, "r", encoding="utf-8") as f: return json.load(f)
-    except Exception: return []
+        with open(DB_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return []
 
 def save_db(data):
     with open(DB_FILE, "w", encoding="utf-8") as f:
@@ -46,57 +50,53 @@ def health():
 
 # -------- playlogDetail HTML 解析 --------
 def parse_detail_html(html: str, url: str) -> dict:
-    """
-    playlogDetail ページの HTML から最低限の情報を抜き出す。
-    取れなければ空文字を返す。
-    """
-    def find(pat, flags=re.I):
+    """playlogDetail の HTML から最低限の情報を抽出"""
+    def find(pat, flags=re.I|re.S):
         m = re.search(pat, html, flags)
         return (m.group(1) if m else "").strip()
 
-    # 曲名（input の value / それが無ければ最初の text input）
     title = (
         find(r'name=["\']music_title["\'][^>]*value=["\']([^"\']+)["\']')
         or find(r'<input[^>]+type=["\']text["\'][^>]*value=["\']([^"\']+)["\']')
     )
-
-    # スコア（100.1234% 形式 → 数値部分だけ）
-    rate = find(r'([0-9]{2,3}\.[0-9]{4})\s*%') or find(r'ACHIEVEMENT[^0-9]*([0-9]{2,3}\.[0-9]{4})')
-
-    # 日時（2025/09/24 23:39 など）
+    rate = (  # 100.1234% など
+        find(r'([0-9]{2,3}\.[0-9]{4})\s*%')
+        or find(r'ACHIEVEMENT[^0-9]*([0-9]{2,3}\.[0-9]{4})')
+    )
     played = find(r'(\d{4}/\d{2}/\d{2}\s+\d{2}:\d{2})')
-
-    # 難易度・レベル
     difficulty = find(r'\b(Re:?MASTER|MASTER|EXPERT|ADVANCED|BASIC)\b')
-    level      = find(r'LEVEL[^0-9]*([0-9]{1,2}\+?)')
-
-    # ジャケット（最初に出てくる画像URLをざっくり）
+    level = find(r'LEVEL[^0-9]*([0-9]{1,2}\+?)')
     image = find(r'<img[^>]+src=["\'](https?://[^"\']+\.(?:png|jpg|jpeg|webp))["\']')
 
     return {
         "title": title,
-        "rate":  rate,               # 例: "100.8390"
-        "playedAt": played,          # 例: "2025/09/24 23:39"
-        "difficulty": difficulty,    # 例: "MASTER" / "Re:MASTER"
-        "level": level,              # 例: "13" / "13+"
+        "rate": rate,
+        "playedAt": played,
+        "difficulty": difficulty,
+        "level": level,
         "imageUrl": image or "",
         "sourceUrl": url or "",
     }
 
 # -------- Ingest --------
 @app.post("/ingest")
-async def ingest(request: Request):
-    # 認証
-    auth = request.headers.get("Authorization", "")
-    if auth != f"Bearer {API_TOKEN}":
+async def ingest(
+    request: Request,
+    credentials: HTTPAuthorizationCredentials = Security(security)
+):
+    # 認証（/docs の Authorize からも通せる）
+    scheme = (credentials.scheme if credentials else "") or ""
+    token  = (credentials.credentials if credentials else "") or ""
+    if scheme.lower() != "bearer" or token != API_TOKEN:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     body = await request.json()
     now  = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    db   = load_db()
+
+    db = load_db()
     inserted = 0
 
-    # ① 従来互換（items 方式）
+    # ① items 方式（従来）
     items = body.get("items") or []
     if isinstance(items, list) and items:
         src = body.get("sourceUrl") or ""
@@ -110,13 +110,12 @@ async def ingest(request: Request):
                 db.append(item)
                 inserted += 1
 
-    # ② 新方式（html 方式）: { "url": "...playlogDetail...", "html": "<!doctype ...>" }
+    # ② html 方式（mrc.js が送る形）
     elif isinstance(body.get("html"), str):
         url  = body.get("url") or body.get("sourceUrl") or ""
         html = body.get("html") or ""
         item = parse_detail_html(html, url)
 
-        # 何かしら取れていれば保存（完全に空ならスキップ）
         if item.get("rate") or item.get("playedAt") or item.get("title"):
             key  = f"{item.get('title','')}|{item.get('rate','')}|{item.get('playedAt','')}"
             uniq = hashlib.sha1(key.encode()).hexdigest()
@@ -136,8 +135,10 @@ def data():
 
 @app.get("/data/pretty", response_class=PlainTextResponse)
 def data_pretty():
-    return PlainTextResponse(json.dumps(load_db(), ensure_ascii=False, indent=2),
-                             media_type="application/json")
+    return PlainTextResponse(
+        json.dumps(load_db(), ensure_ascii=False, indent=2),
+        media_type="application/json"
+    )
 
 @app.get("/data.csv", response_class=PlainTextResponse)
 def data_csv():
@@ -164,14 +165,12 @@ def human_rate(v):
 def diff_badge(d, level=None):
     d_raw = (d or "").strip()
     d_l = d_raw.lower()
-    # base color map
     color = "#64748b"; label = d_raw or "-"
     if "basic" in d_l:   color, label = "#22c55e","BASIC"
     elif "advanced" in d_l or d_l=="adv": color, label = "#eab308","ADVANCED"
     elif "expert" in d_l:  color, label = "#ef4444","EXPERT"
     elif "master" in d_l and "re" not in d_l: color, label = "#a855f7","MASTER"
     elif "re:master" in d_l or "remaster" in d_l or "re"==d_l:
-        # Re:MASTER = 白地＋紫縁取り
         badge = "<span class='badge remaster'>Re:MASTER</span>"
         if level: badge += f"<span class='lvl'>{esc(level)}</span>"
         return badge
@@ -197,7 +196,6 @@ def view():
     data = load_db()
     data.sort(key=lambda r: r.get("ingestedAt",""), reverse=True)
 
-    # 日付ごとにまとめる
     groups = {}
     for r in data:
         d = date_of(r.get("playedAt",""))
@@ -211,7 +209,6 @@ def view():
     for d, rows in sorted(groups.items(), key=lambda x:x[0], reverse=True):
         rows_html = []
         for r in rows:
-            # NEW判定
             is_new = False
             try:
                 ts = datetime.strptime(r.get("ingestedAt",""), "%Y-%m-%d %H:%M:%S").timestamp()
@@ -229,7 +226,10 @@ def view():
             new_tag = "<span class='new'>NEW</span>" if is_new else ""
 
             img = r.get("imageUrl") or PLACEHOLDER_IMG or ""
-            img_html = f"<img class='jacket' src='{esc(img)}' alt=' ' loading='lazy' referrerpolicy='no-referrer'>" if img else "<div class='jacket ph'></div>"
+            img_html = (
+                f"<img class='jacket' src='{esc(img)}' alt=' ' loading='lazy' referrerpolicy='no-referrer'>"
+                if img else "<div class='jacket ph'></div>"
+            )
 
             rows_html.append(f"""
 <li class='row'>
@@ -308,7 +308,6 @@ def view():
     display:inline-block; background:repeating-linear-gradient(45deg, #0b1220 0 8px, #0e1627 8px 16px);
   }}
 
-  /* 難易度バッジ */
   .badge {{
     display:inline-block; padding:2px 6px; border-radius:999px; color:#fff; font-size:11px; margin-left:6px;
   }}
@@ -319,14 +318,10 @@ def view():
     margin-left:6px; font-size:11px; color:#e5e7eb; opacity:.9;
     border:1px dashed rgba(255,255,255,.25); border-radius:999px; padding:1px 6px;
   }}
-
-  /* NEWタグ */
   .new {{
     margin-left:8px; font-size:10px; color:#22c55e; font-weight:700; border:1px solid #22c55e;
     padding:1px 4px; border-radius:6px;
   }}
-
-  /* ランク色（右側スコア） */
   .rk-sssplus {{ color:#f97316; background:linear-gradient(90deg,#f59e0b,#f43f5e); -webkit-background-clip:text; color:transparent; }}
   .rk-sss     {{ color:#f97316; }}
   .rk-ssplus  {{ color:#eab308; }}
@@ -351,7 +346,6 @@ def view():
 
 # -------- 補助API --------
 def parse_played_at(s: str):
-    # "YYYY/MM/DD HH:MM" → datetime
     try:
         return datetime.strptime(s, "%Y/%m/%d %H:%M")
     except Exception:
@@ -359,10 +353,6 @@ def parse_played_at(s: str):
 
 @app.get("/latest")
 def latest(source: str = ""):
-    """
-    これまで保存済みの中で一番新しい playedAt を返す。
-    ?source= を指定すると sourceUrl が一致するものに限定（空なら全体）。
-    """
     data = load_db()
     latest_dt = None
     latest_str = ""
