@@ -14,10 +14,9 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_methods=["*"], allow_headers=["*"], allow_credentials=False
 )
-
 security = HTTPBearer(auto_error=False)
 
-# -------- /register 取り込み --------
+# -------- /register 取り込み（任意）--------
 try:
     from register_router import router as register_router
     app.include_router(register_router)  # /register
@@ -49,111 +48,98 @@ def save_db(data):
 def health():
     return {"ok": True}
 
-# -------- playlogDetail HTML 解析 --------
+# -------- playlogDetail HTML 解析（強化） --------
 def parse_detail_html(html: str, url: str) -> dict:
-    """playlogDetail の HTML から最低限の情報を抽出"""
+    """playlogDetail の HTML から曲名/達成率/日時/難易度/レベル/画像を抽出（タグ分割・相対URL対応）"""
     def find(pat, flags=re.I | re.S):
         m = re.search(pat, html, flags)
         return (m.group(1) if m else "").strip()
 
-    # タイトル（できるだけ確実に）
+    # タグ除去テキスト（分割された数字・難易度を拾う）
+    text = re.sub(r"<[^>]+>", " ", html)
+    text = re.sub(r"\s+", " ", text)
+
+    # ---- タイトル（候補を広く）----
     title = (
-        find(r'name=["\']music_title["\'][^>]*value=["\']([^"\']+)["\']') or
-        find(r'<input[^>]+type=["\']text["\'][^>]*value=["\']([^"\']+)["\']') or
+        find(r'(?:name|id)=["\']music_title["\'][^>]*value=["\']([^"\']+)["\']') or
+        find(r'<img[^>]+alt=["\']([^"\']+)["\'][^>]*class=["\'][^"\']*music[^"\']*["\']') or
         find(r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']+)["\']') or
-        find(r'<h[1-4][^>]*>([^<]{2,})</h[1-4]>') or
-        find(r'<img[^>]+class=["\'][^"\']*(?:music|jacket)[^"\']*["\'][^>]*alt=["\']([^"\']+)["\']')
+        find(r'<h[1-4][^>]*>([^<]{2,})</h[1-4]>')
     )
 
-    # スコア（100.1234% など）
-    rate = (
-        find(r'([0-9]{2,3}\.[0-9]{4})\s*%') or
-        find(r'ACHIEVEMENT[^0-9]*([0-9]{2,3}\.[0-9]{4})')
+    # ---- 達成率（タグ分割対策でプレーンテキストから）----
+    rate = ""
+    m = re.search(r'([0-9]{2,3}\.[0-9]{4})\s*[％%]', text)
+    if m:
+        rate = m.group(1)
+    else:
+        rate = (
+            find(r'ACHIEVEMENT[^0-9]*([0-9]{2,3}\.[0-9]{4})') or
+            find(r'([0-9]{2,3}\.[0-9]{4})\s*[％%]')
+        ) or ""
+
+    # ---- 日時 ----
+    played = ""
+    m = re.search(r'(\d{4}/\d{2}/\d{2}\s+\d{2}:\d{2})', text)
+    if m: played = m.group(1)
+
+    # ---- 難易度・レベル ----
+    difficulty = ""
+    m = re.search(r'\b(Re:?MASTER|MASTER|EXPERT|ADVANCED|BASIC)\b', text, re.I)
+    if m: difficulty = m.group(1).upper().replace("REMSTER", "RE:MASTER")
+    level = ""
+    m = re.search(r'LEVEL\s*([0-9]{1,2}\+?)', text, re.I)
+    if m: level = m.group(1)
+
+    # ---- ジャケット（相対→絶対）----
+    img = (
+        find(r'<img[^>]+src=["\']([^"\']+\.(?:png|jpg|jpeg|webp))["\']') or
+        find(r'background-image:\s*url\(["\']?([^"\')]+)["\']?\)')
     )
-
-    # 日時
-    played = find(r'(\d{4}/\d{2}/\d{2}\s+\d{2}:\d{2})')
-
-    # 難易度・レベル
-    difficulty = find(r'\b(Re:?MASTER|MASTER|EXPERT|ADVANCED|BASIC)\b')
-    level = find(r'LEVEL[^0-9]*([0-9]{1,2}\+?)')
-
-    # ジャケット（相対URL→絶対に変換）
-    image = (
-        find(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']') or
-        find(r'<img[^>]+class=["\'][^"\']*(?:music|jacket|scoreBack|playlog)[^"\']*["\'][^>]*src=["\']([^"\']+)["\']') or
-        find(r'<img[^>]+src=["\'](https?://[^"\']+\.(?:png|jpg|jpeg|webp))["\']') or
-        find(r'background-image:\s*url\(["\']?(https?://[^"\')]+)["\']?\)')
-    )
-    if image and not re.match(r'^https?://', image):
-        try:
-            image = urljoin(url or '', image)
-        except Exception:
-            pass
+    if img:
+        if img.startswith("//"):
+            img = "https:" + img
+        else:
+            img = urljoin(url or "https://maimaidx.jp/", img)
 
     return {
-        "title": title,
-        "rate": rate,                 # "100.1234"
-        "playedAt": played,           # "YYYY/MM/DD HH:MM"
-        "difficulty": difficulty,     # "MASTER" / "Re:MASTER" etc
-        "level": level,               # "13" / "13+"
-        "imageUrl": image or "",
+        "title": title or "",
+        "rate": rate,
+        "playedAt": played,
+        "difficulty": difficulty,
+        "level": level,
+        "imageUrl": img or "",
         "sourceUrl": url or "",
     }
 
-# ---- 既存データを同一プレイとみなす条件
-def is_same_play(a: dict, b: dict) -> bool:
-    pa = (a.get("playedAt") or "").strip()
-    pb = (b.get("playedAt") or "").strip()
-    ra = (a.get("rate") or "").strip()
-    rb = (b.get("rate") or "").strip()
-    return bool(pa and pb and pa == pb and ra and rb and ra == rb)
-
-# 共通: 受信ボディを DB に反映
+# -------- 本文→DB 反映 --------
 def ingest_from_body(body: dict, now: str) -> int:
     db = load_db()
     inserted = 0
 
-    def upsert_item(item: dict, src_hint: str = ""):
-        nonlocal inserted, db
-        key  = f"{item.get('title','')}|{item.get('rate','')}|{item.get('playedAt','')}"
-        uniq = hashlib.sha1(key.encode()).hexdigest()
-
-        # 1) 完全一致（uniq）なら何もしない
-        if any(r.get("uniq") == uniq for r in db):
-            return
-
-        # 2) 同一プレイ(playedAt×rate)が既にあれば補完更新
-        for r in db:
-            if is_same_play(r, item):
-                for k in ["title", "difficulty", "level", "imageUrl", "sourceUrl"]:
-                    v = item.get(k)
-                    if v and (not r.get(k)):
-                        r[k] = v
-                # uniq も更新（タイトルが埋まるとキーが変わるため）
-                r["uniq"] = uniq
-                return
-
-        # 3) 新規として追加
-        item["uniq"]       = uniq
-        if src_hint and not item.get("sourceUrl"):
-            item["sourceUrl"] = src_hint
-        item["ingestedAt"] = item.get("ingestedAt") or now
-        db.append(item)
-        inserted += 1
-
     items = body.get("items") or []
     if isinstance(items, list) and items:
         src = body.get("sourceUrl") or ""
-        for it in items:
-            upsert_item(dict(it), src_hint=src)
+        for item in items:
+            key  = f"{item.get('title','')}|{item.get('rate','')}|{item.get('playedAt','')}"
+            uniq = hashlib.sha1(key.encode()).hexdigest()
+            if not any(r.get("uniq")==uniq for r in db):
+                item["uniq"]       = uniq
+                item["sourceUrl"]  = item.get("sourceUrl") or src
+                item["ingestedAt"] = body.get("ingestedAt") or now
+                db.append(item); inserted += 1
 
     elif isinstance(body.get("html"), str):
         url  = body.get("url") or body.get("sourceUrl") or ""
         html = body.get("html") or ""
-        it = parse_detail_html(html, url)
-        if it.get("rate") or it.get("playedAt") or it.get("title"):
-            upsert_item(it, src_hint=url)
+        item = parse_detail_html(html, url)
+        if item.get("rate") or item.get("playedAt") or item.get("title"):
+            key  = f"{item.get('title','')}|{item.get('rate','')}|{item.get('playedAt','')}"
+            uniq = hashlib.sha1(key.encode()).hexdigest()
+            if not any(r.get("uniq")==uniq for r in db):
+                item["uniq"]       = uniq
+                item["ingestedAt"] = now
+                db.append(item); inserted += 1
     else:
         raise HTTPException(
             status_code=400,
@@ -163,7 +149,7 @@ def ingest_from_body(body: dict, now: str) -> int:
     save_db(db)
     return inserted
 
-# -------- Ingest（通常の JSON / fetch 用）--------
+# -------- Ingest（JSON/fetch）--------
 @app.post("/ingest")
 async def ingest(
     request: Request,
@@ -181,7 +167,7 @@ async def ingest(
             }
         },
         "html": {
-            "summary": "HTML 方式（mrc.js が送る形）",
+            "summary": "HTML 方式（mrc.js / ブックマークが送る形）",
             "value": {
                 "url": "https://example.com/playlogDetail",
                 "html": "<input name='music_title' value='テスト曲'><div>ACHIEVEMENT 100.5678%</div><div>2025/09/25 23:59</div><div>MASTER</div><div>LEVEL 13</div>"
@@ -189,25 +175,22 @@ async def ingest(
         }
     })
 ):
-    # 認証（ヘッダ or ?token）
+    # 認証（ヘッダ Bearer か ?token のどちらかOK）
     scheme = (credentials.scheme if credentials else "") or ""
     token_h = (credentials.credentials if credentials else "") or ""
     token_q = request.query_params.get("token") or ""
-    token = token_h or token_q
-    if (scheme.lower() == "bearer" and token_h == API_TOKEN) or (token_q == API_TOKEN):
-        pass
-    else:
+    if not ((scheme.lower() == "bearer" and token_h == API_TOKEN) or (token_q == API_TOKEN)):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     inserted = ingest_from_body(body, now)
     return JSONResponse({"status":"ok", "inserted": inserted, "total": len(load_db())})
 
-# -------- Ingest（フォーム / x-www-form-urlencoded / 生JSON すべてOK）--------
+# -------- Ingest（フォーム / x-www-form-urlencoded / 生JSON もOK）--------
 @app.post("/ingest_form")
 async def ingest_form(
     request: Request,
-    token: str = Query("", description="API token (fallback when header not used)")
+    token: str = Query("", description="API token (?token=...)")
 ):
     if token != API_TOKEN:
         raise HTTPException(status_code=401, detail="Unauthorized (token)")
@@ -217,7 +200,6 @@ async def ingest_form(
         raise HTTPException(status_code=400, detail="Empty body")
 
     ctype = request.headers.get("Content-Type", "")
-    body: dict
     if "application/x-www-form-urlencoded" in ctype:
         d = parse_qs(raw.decode("utf-8"))
         payload = (d.get("payload") or [""])[0]
@@ -415,8 +397,8 @@ def view():
             border:1px solid rgba(255,255,255,.08); background:#0b1220; }}
   .jacket.ph {{ display:inline-block; background:repeating-linear-gradient(45deg, #0b1220 0 8px, #0e1627 8px 16px); }}
 
-  .badge {{ display:inline-block; padding:2px 6px; border-radius:999px; color:#fff; font-size:11px; margin-left:6px; }}
-  .badge.remaster {{ background:#fff; color:#a855f7; border:2px solid #a855f7; padding:1px 6px; }}
+  .badge {{ display:inline-block; padding:2px 6px; border-radius:999px; color:#fff; font-size:11px; }}
+  .badge.remaster {{ background:#fff; color:#a855f7; border:2px solid #a855f7; padding:1px 6px; margin-left:6px; }}
   .lvl {{ margin-left:6px; font-size:11px; color:#e5e7eb; opacity:.9; border:1px dashed rgba(255,255,255,.25); border-radius:999px; padding:1px 6px; }}
 
   .new {{ margin-left:8px; font-size:10px; color:#22c55e; font-weight:700; border:1px solid #22c55e; padding:1px 4px; border-radius:6px; }}
