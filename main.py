@@ -1,12 +1,12 @@
 # main.py
 from fastapi import FastAPI, HTTPException, Security, Body, Request, Query
-from fastapi.responses import JSONResponse, PlainTextResponse, HTMLResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, HTMLResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import json, os, hashlib, csv, re
 from io import StringIO
 from datetime import datetime
-from urllib.parse import parse_qs  # ← 追加：x-www-form-urlencoded を自前で読む
+from urllib.parse import parse_qs  # x-www-form-urlencoded を読む用
 
 # -------- FastAPI --------
 app = FastAPI()
@@ -44,7 +44,11 @@ def save_db(data):
     with open(DB_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False)
 
-# -------- Health --------
+# -------- Root / Health --------
+@app.get("/")
+def root():
+    return RedirectResponse("/view")
+
 @app.get("/health")
 def health():
     return {"ok": True}
@@ -56,7 +60,7 @@ def parse_detail_html(html: str, url: str) -> dict:
         m = re.search(pat, html, flags)
         return (m.group(1) if m else "").strip()
 
-    # タイトル候補を手広く
+    # タイトル候補（複数フォールバック）
     title = (
         find(r'name=["\']music_title["\'][^>]*value=["\']([^"\']+)["\']') or
         find(r'<input[^>]+type=["\']text["\'][^>]*value=["\']([^"\']+)["\']') or
@@ -94,11 +98,12 @@ def parse_detail_html(html: str, url: str) -> dict:
         "sourceUrl": url or "",
     }
 
-# 共通: 受信ボディを DB に反映
+# -------- 共通: 受信ボディを DB に反映 --------
 def ingest_from_body(body: dict, now: str) -> int:
     db = load_db()
     inserted = 0
 
+    # ① items 方式
     items = body.get("items") or []
     if isinstance(items, list) and items:
         src = body.get("sourceUrl") or ""
@@ -112,6 +117,7 @@ def ingest_from_body(body: dict, now: str) -> int:
                 db.append(item)
                 inserted += 1
 
+    # ② html 方式
     elif isinstance(body.get("html"), str):
         url  = body.get("url") or body.get("sourceUrl") or ""
         html = body.get("html") or ""
@@ -133,7 +139,7 @@ def ingest_from_body(body: dict, now: str) -> int:
     save_db(db)
     return inserted
 
-# -------- Ingest（通常の JSON / fetch 用）--------
+# -------- Ingest（JSON/fetch 用）--------
 @app.post("/ingest")
 async def ingest(
     request: Request,
@@ -163,7 +169,6 @@ async def ingest(
     scheme = (credentials.scheme if credentials else "") or ""
     token_h = (credentials.credentials if credentials else "") or ""
     token_q = request.query_params.get("token") or ""
-    token = token_h or token_q
     if (scheme.lower() == "bearer" and token_h == API_TOKEN) or (token_q == API_TOKEN):
         pass
     else:
@@ -173,41 +178,60 @@ async def ingest(
     inserted = ingest_from_body(body, now)
     return JSONResponse({"status":"ok", "inserted": inserted, "total": len(load_db())})
 
-# -------- Ingest（フォーム / x-www-form-urlencoded / 生JSON すべてOK）--------
-@app.post("/ingest_form")
+# -------- Ingest（フォーム/x-www-form-urlencoded/生JSON すべてOK）--------
+@app.post("/ingest_form", response_class=HTMLResponse)
 async def ingest_form(
     request: Request,
     token: str = Query("", description="API token (fallback when header not used)")
 ):
+    # 認証（ブックマークレットは ?token=... で渡す）
     if token != API_TOKEN:
-        raise HTTPException(status_code=401, detail="Unauthorized (token)")
+        return HTMLResponse("<h1>401 Unauthorized</h1>", status_code=401)
 
     raw = await request.body()
     if not raw:
-        raise HTTPException(status_code=400, detail="Empty body")
+        return HTMLResponse("<h1>400 Empty body</h1>", status_code=400)
 
     ctype = request.headers.get("Content-Type", "")
-    body: dict
-    if "application/x-www-form-urlencoded" in ctype:
-        # ブックマークレットの <form> から飛んでくる想定
-        d = parse_qs(raw.decode("utf-8"))
-        payload = (d.get("payload") or [""])[0]
-        if not payload:
-            raise HTTPException(status_code=400, detail="Missing 'payload'")
-        try:
+    try:
+        if "application/x-www-form-urlencoded" in ctype:
+            d = parse_qs(raw.decode("utf-8"))
+            payload = (d.get("payload") or [""])[0]
             body = json.loads(payload)
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Invalid JSON in 'payload': {e}")
-    else:
-        # 素の JSON も許可
-        try:
+        else:
             body = json.loads(raw.decode("utf-8"))
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Invalid JSON: {e}")
+    except Exception as e:
+        return HTMLResponse(f"<h1>400 Invalid JSON</h1><pre>{e}</pre>", status_code=400)
 
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    inserted = ingest_from_body(body, now)
-    return JSONResponse({"status":"ok", "inserted": inserted, "total": len(load_db())})
+    try:
+        inserted = ingest_from_body(body, now)
+    except HTTPException as he:
+        return HTMLResponse(f"<h1>{he.status_code} Error</h1><pre>{he.detail}</pre>", status_code=he.status_code)
+    except Exception as e:
+        return HTMLResponse(f"<h1>500 Server Error</h1><pre>{e}</pre>", status_code=500)
+
+    # 成功画面（自動遷移）
+    html = f"""<!doctype html>
+<meta charset="utf-8">
+<title>ingested</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="refresh" content="0.8; url=/view">
+<style>
+  body {{ font-family:-apple-system,system-ui,Segoe UI,Roboto,'Noto Sans JP',sans-serif;
+         background:#0f172a; color:#e5e7eb; display:grid; place-items:center; height:100dvh; margin:0; }}
+  .card {{ background:#111827; border:1px solid rgba(255,255,255,.08); padding:20px 24px; border-radius:12px; }}
+  .muted {{ color:#94a3b8; font-size:13px; }}
+  a {{ color:#93c5fd; text-decoration:none; }}
+</style>
+<div class="card">
+  <h1 style="margin:0 0 6px">送信完了</h1>
+  <div>取り込み <b>{inserted}</b> 件</div>
+  <div class="muted">自動で結果ページへ移動します。<br><a href="/view">移動しない場合はここをタップ</a></div>
+</div>
+<script>setTimeout(()=>location.replace("/view"), 600);</script>
+"""
+    return HTMLResponse(html, status_code=200)
 
 # -------- Data 出力 --------
 @app.get("/data")
