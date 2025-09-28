@@ -1,13 +1,11 @@
 # main.py
-from fastapi import FastAPI, HTTPException, Security, Body
+from fastapi import FastAPI, HTTPException, Security, Body, Request, Form, Query
 from fastapi.responses import JSONResponse, PlainTextResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import json, os, hashlib, csv, re
 from io import StringIO
 from datetime import datetime
-from urllib.parse import urljoin
-import html as ihtml  # HTMLエンティティをデコード
 
 # -------- FastAPI --------
 app = FastAPI()
@@ -16,7 +14,6 @@ app.add_middleware(
     allow_origins=["*"], allow_methods=["*"], allow_headers=["*"], allow_credentials=False
 )
 
-# Swagger で Bearer 入力欄を出す用
 security = HTTPBearer(auto_error=False)
 
 # -------- /register 取り込み --------
@@ -51,65 +48,29 @@ def save_db(data):
 def health():
     return {"ok": True}
 
-# -------- playlogDetail HTML 解析（強化版）--------
+# -------- playlogDetail HTML 解析 --------
 def parse_detail_html(html: str, url: str) -> dict:
-    """
-    playlogDetail の HTML から最小限の情報を抽出（タグ分割にも強い版）
-    - テキスト化して 100.1234% / YYYY/MM/DD HH:MM / 難易度 などを抽出
-    - 画像の相対URLは urljoin で絶対URLに解決
-    """
+    """playlogDetail の HTML から最低限の情報を抽出"""
     def find(pat, flags=re.I | re.S):
         m = re.search(pat, html, flags)
         return (m.group(1) if m else "").strip()
 
-    # タグを除去したテキスト（数値が <span> で分割されても検出できるように）
-    def as_text(h: str) -> str:
-        h = re.sub(r"<script[^>]*>.*?</script>|<style[^>]*>.*?</style>", " ", h, flags=re.I | re.S)
-        h = re.sub(r"<[^>]+>", " ", h)
-        h = ihtml.unescape(h)
-        h = re.sub(r"\s+", " ", h).strip()
-        return h
-
-    text = as_text(html)
-
-    # --- 曲名 ---
     title = (
-        # input value
         find(r'name=["\']music_title["\'][^>]*value=["\']([^"\']+)["\']')
-        or find(r'id=["\']music_title["\'][^>]*value=["\']([^"\']+)["\']')
         or find(r'<input[^>]+type=["\']text["\'][^>]*value=["\']([^"\']+)["\']')
-        # class が title / music を含む要素の直下テキスト
-        or find(r'class=["\'][^"\']*(?:music[^"\']*|title)[^"\']*["\'][^>]*>([^<]{1,80})<')
-        # 画像の alt
-        or find(r'<img[^>]+alt=["\']([^"\']{1,80})["\']')
+        or find(r'<h[1-4][^>]*>([^<]{2,})</h[1-4]>')  # 念のため見出し fallback
     )
-
-    # --- スコア（100.1234%）---
-    m = re.search(r'(\d{2,3}\.\d{4})\s*%', text)
-    if m:
-        rate = m.group(1)
-    else:
-        m2 = re.search(r'ACHIEVEMENT.*?(\d{2,3}\.\d{4}).*?%', html, flags=re.I | re.S)
-        rate = (m2.group(1).strip() if m2 else "")
-
-    # --- プレイ日時 ---
-    played = ""
-    m = re.search(r'(\d{4}/\d{2}/\d{2}\s+\d{2}:\d{2})', text)
-    if m:
-        played = m.group(1)
-
-    # --- 難易度・レベル ---
-    md = re.search(r'(Re:?MASTER|MASTER|EXPERT|ADVANCED|BASIC)', text, flags=re.I)
-    difficulty = (md.group(1) if md else "")
-    ml = re.search(r'LEVEL\s*([0-9]{1,2}\+?)', text, flags=re.I)
-    level = (ml.group(1) if ml else "")
-
-    # --- ジャケット画像 ---
-    img = (
-        find(r'<img[^>]+src=["\']([^"\']+\.(?:png|jpg|jpeg|webp))["\']')
-        or find(r'background-image:\s*url\((["\']?)([^)]+?\.(?:png|jpg|jpeg|webp))\1\)', flags=re.I)
+    rate = (
+        find(r'([0-9]{2,3}\.[0-9]{4})\s*%')
+        or find(r'ACHIEVEMENT[^0-9]*([0-9]{2,3}\.[0-9]{4})')
     )
-    image_url = urljoin(url or "", img) if img else ""
+    played = find(r'(\d{4}/\d{2}/\d{2}\s+\d{2}:\d{2})')
+    difficulty = find(r'\b(Re:?MASTER|MASTER|EXPERT|ADVANCED|BASIC)\b')
+    level = find(r'LEVEL[^0-9]*([0-9]{1,2}\+?)')
+    image = (
+        find(r'<img[^>]+src=["\'](https?://[^"\']+\.(?:png|jpg|jpeg|webp))["\']')
+        or find(r'background-image:\s*url\(["\']?(https?://[^"\')]+)["\']?\)')
+    )
 
     return {
         "title": title,
@@ -117,54 +78,15 @@ def parse_detail_html(html: str, url: str) -> dict:
         "playedAt": played,           # "YYYY/MM/DD HH:MM"
         "difficulty": difficulty,     # "MASTER" / "Re:MASTER" etc
         "level": level,               # "13" / "13+"
-        "imageUrl": image_url,
+        "imageUrl": image or "",
         "sourceUrl": url or "",
     }
 
-# -------- Ingest（Swagger に Request body を表示）--------
-@app.post("/ingest")
-async def ingest(
-    credentials: HTTPAuthorizationCredentials = Security(security),
-    body: dict = Body(
-        ...,
-        examples={
-            "items": {
-                "summary": "items 方式（簡単テスト用）",
-                "value": {
-                    "sourceUrl": "manual-test",
-                    "items": [
-                        {
-                            "title": "テスト曲",
-                            "rate": "100.1234",
-                            "playedAt": "2025/09/25 12:34",
-                            "difficulty": "MASTER",
-                            "level": "13",
-                            "imageUrl": ""
-                        }
-                    ]
-                }
-            },
-            "html": {
-                "summary": "HTML 方式（mrc.js が送る形）",
-                "value": {
-                    "url": "https://example.com/playlogDetail",
-                    "html": "<input name='music_title' value='テスト曲'><div>ACHIEVEMENT 100.5678%</div><div>2025/09/25 23:59</div><div>MASTER</div><div>LEVEL 13</div>"
-                }
-            }
-        }
-    )
-):
-    # 認証
-    scheme = (credentials.scheme if credentials else "") or ""
-    token  = (credentials.credentials if credentials else "") or ""
-    if scheme.lower() != "bearer" or token != API_TOKEN:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+# 共通: 受信ボディを DB に反映
+def ingest_from_body(body: dict, now: str) -> int:
     db = load_db()
     inserted = 0
 
-    # ① items 方式
     items = body.get("items") or []
     if isinstance(items, list) and items:
         src = body.get("sourceUrl") or ""
@@ -178,7 +100,6 @@ async def ingest(
                 db.append(item)
                 inserted += 1
 
-    # ② html 方式（mrc.js）
     elif isinstance(body.get("html"), str):
         url  = body.get("url") or body.get("sourceUrl") or ""
         html = body.get("html") or ""
@@ -198,7 +119,77 @@ async def ingest(
         )
 
     save_db(db)
-    return JSONResponse({"status":"ok", "inserted": inserted, "total": len(db)})
+    return inserted
+
+# -------- Ingest（通常の JSON / fetch 用）--------
+@app.post("/ingest")
+async def ingest(
+    request: Request,
+    credentials: HTTPAuthorizationCredentials = Security(security),
+    body: dict = Body(..., examples={
+        "items": {
+            "summary": "items 方式（簡単テスト用）",
+            "value": {
+                "sourceUrl": "manual-test",
+                "items": [{
+                    "title": "テスト曲", "rate": "100.1234",
+                    "playedAt": "2025/09/25 12:34", "difficulty": "MASTER",
+                    "level": "13", "imageUrl": ""
+                }]
+            }
+        },
+        "html": {
+            "summary": "HTML 方式（mrc.js が送る形）",
+            "value": {
+                "url": "https://example.com/playlogDetail",
+                "html": "<input name='music_title' value='テスト曲'><div>ACHIEVEMENT 100.5678%</div><div>2025/09/25 23:59</div><div>MASTER</div><div>LEVEL 13</div>"
+            }
+        }
+    })
+):
+    # 認証（ヘッダ or ?token）
+    scheme = (credentials.scheme if credentials else "") or ""
+    token_h = (credentials.credentials if credentials else "") or ""
+    token_q = request.query_params.get("token") or ""
+    token = token_h or token_q
+    if (scheme.lower() == "bearer" and token_h == API_TOKEN) or (token_q == API_TOKEN):
+        pass
+    else:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    inserted = ingest_from_body(body, now)
+    return JSONResponse({"status":"ok", "inserted": inserted, "total": len(load_db())})
+
+# -------- Ingest（フォーム/テキストでもOK：ブックマークレット用）--------
+@app.post("/ingest_form")
+async def ingest_form(
+    request: Request,
+    token: str = Query("", description="API token (fallback when header not used)"),
+    payload: str | None = Form(default=None, description="JSON string payload")
+):
+    # 認証（?token だけでOK）
+    if token != API_TOKEN:
+        raise HTTPException(status_code=401, detail="Unauthorized (token)")
+
+    # 本文を取得（form の payload か、生テキスト）
+    if payload is None:
+        raw = await request.body()
+        if not raw:
+            raise HTTPException(status_code=400, detail="Empty body")
+        try:
+            body = json.loads(raw.decode("utf-8"))
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid JSON")
+    else:
+        try:
+            body = json.loads(payload)
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid JSON in 'payload'")
+
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    inserted = ingest_from_body(body, now)
+    return JSONResponse({"status":"ok", "inserted": inserted, "total": len(load_db())})
 
 # -------- Data 出力 --------
 @app.get("/data")
